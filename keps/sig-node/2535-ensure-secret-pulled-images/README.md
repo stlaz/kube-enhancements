@@ -76,14 +76,21 @@ Thus even if the image is present, it may still be reauthenticated.
 
 This behavior mirrors what would happen if an image was not present on the node (as opposed to present, but yet to be authorized with the credentials present).
 
-This will be enforced for both `IfNotPresent` and `Never` policies with the exception for images that were
-pre-loaded on the node and the kubelet does not track them. An administrator will be allowed to modify this behavior
-so that only a specified subset of these pre-loaded images can be pulled without re-authenticating.
-**TODO**: describe the kubelet configuration option for allow-listing images
+This will be enforced for both `IfNotPresent` and `Never` policies.
 
-The goal is to enable this new behavior by default with an option to revert to the old one by using a kubelet configuration
+Kubelet configuration will give the administrator the ability to choose how pre-loaded images should be verified:
+1. *Do not* allow access to *any* pre-loaded images without verification.
+2. Only allow access to a *specific list* of pre-loaded images without verification.
+3. *Allow* access to *all* pre-loaded images without verification (default behavior).
+
+The administrator will also have a choice to allow access to all images without
+verification - this is the default behavior without this feature - kubelet configuration
 field `noPullImageSecretRecheck`.
 
+**TODO**: describe the kubelet configuration option for allow-listing images
+**TODO**: do we want to allow disabling the feature (== reverting back to the old behavior)?
+
+During development, this feature will be guarded by a feature gate.
 
 *** The issue and these changes improving the security posture without requiring the forcing of pull always, will be documented in the kubernetes image pull policy documentation. ***
 
@@ -125,7 +132,7 @@ Images successfully pulled through the kubelet with no `ImagePullSecrets`/authen
 not require authentication.
 
 The new behavior is designed in a way so that it replaces current behavior - it is going
-to be an on-by-default feature.
+to be an on-by-default feature once graduated.
 
 ### Non-Goals
 
@@ -141,12 +148,15 @@ to recheck image license entitlement, but is a non-goal for this enhancement.
 
 ## Proposal
 
-A new API will be created to represent metadata about image pulls being authenticated. This API
-will be used by the kubelet to persist this metadata in file(s) on the kubelet's node.
-The API is a representation of the kubelet's in-memory state, where the kubelet tracks
-information about image pulls being authenticated.
+The kubelet will track container images and the list of authentication information
+that lead to their successful pulls. This data will be persisted across reboots
+of the host and restarts of the kubelet.
 
-The kubelet will ensure any image it keeps a track of is always pulled if authentication information
+The persistent authentication data storage will be done using files kept in the
+kubelet directory on the node. The content of these files will be structured and
+versioned using standard config file API versioning techniques.
+
+The kubelet will ensure any image requiring credential verification is always pulled if authentication information
 from an image pull is not yet present, thus enforcing authentication / re-authentication.
 
 A new kubelet configuration option will be added, as well as a feature
