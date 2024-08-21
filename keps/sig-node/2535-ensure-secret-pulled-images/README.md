@@ -78,17 +78,11 @@ This behavior mirrors what would happen if an image was not present on the node 
 
 This will be enforced for both `IfNotPresent` and `Never` policies.
 
-Kubelet configuration will give the administrator the ability to choose how pre-loaded images should be verified:
-1. *Do not* allow access to *any* pre-loaded images without verification.
+Kubelet configuration will give the administrator the ability to choose how images should be verified:
+1. *Do not* allow access to *any* images without verification.
 2. Only allow access to a *specific list* of pre-loaded images without verification.
 3. *Allow* access to *all* pre-loaded images without verification (default behavior).
-
-The administrator will also have a choice to allow access to all images without
-verification - this is the default behavior without this feature - kubelet configuration
-field `noPullImageSecretRecheck`.
-
-**TODO**: describe the kubelet configuration option for allow-listing images
-**TODO**: do we want to allow disabling the feature (== reverting back to the old behavior)?
+4. Allow access to all images without having to reverify credentials (previous behavior).
 
 During development, this feature will be guarded by a feature gate.
 
@@ -159,12 +153,32 @@ versioned using standard config file API versioning techniques.
 The kubelet will ensure any image requiring credential verification is always pulled if authentication information
 from an image pull is not yet present, thus enforcing authentication / re-authentication.
 
-A new kubelet configuration option will be added, as well as a feature
-gate to gate its use:
-- `noPullImageSecretRecheck`
-    - A boolean that toggles the new behavior. If `true`, the kubelet will fallback to the
-      old behavior: only pull an image if it's not present.
-    - Defaults to `false`.
+Two new kubelet configuration options will be added, as well as a feature
+gate to gate their use:
+- `imagePullCredentialsVerificationPolicy`
+    - An enum of 4 possible values:
+      - `NeverVerify`
+        - anyone on a node can use any image present on the node
+      - `NeverVerifyNodePreloadedImages`
+        - **default value**
+        - images that were pulled to the node by something else than the kubelet can be used without reverifying pull credentials
+      - `NeverVerifyAllowlistedImages`
+        - like `NeverVerifyNodePreloadedImages` but only node images from `preloadedImagesVerificationAllowlist` don't require reverification
+      - `AlwaysVerify`
+        - all images pulled with credentials require credential reverification
+- `preloadedImagesVerificationAllowlist`
+  - a string list to be used with the `NeverVerifyAllowlistedImages` image pull credentials verification policy
+  - images specified by this list will not require credential reverification if they are requested
+    by a pod with `IfNotPresent` or `Never` image pull policies
+  - the list accepts wildcard suffix in a string where `*` is the wildcard character
+  - granularity:
+    - finest: image name
+    - coarsest: registry host
+  - example list values:
+    - registry.host/org/image-name
+    - registry.host/public-org/*
+    - registry.host/*
+  - notice registry.host/org/image-name:tag would be invalid as image name is considered the most granular possible configuration
 
 ### User Stories
 
@@ -195,12 +209,10 @@ require authentication.
 
 - Images can be "pre-loaded", or pulled behind the kubelet's back before it starts.
   In this case, the kubelet is not managing the credentials for these images.
-  - To mitigate, metadata will be persisted across reboot. The kubelet will compare previously
+  - To mitigate, metadata matching the image pull credentials verification policy will be
+    persisted across reboot. The kubelet will compare previously
     cached credentials against the images that exist. On a new image pull, the kubelet will use
     its saved cache and revalidate as necessary.
-    In other words: even if the images are already cached, if new images are present that have not
-    previously been authenticated against a pods credentials, then the image will be revalidated.
-  - **TODO**: consider using an optional list of no-auth images in kubelet configuration
 
 
 ## Design Details
@@ -231,38 +243,88 @@ Note that using the tag `:latest` is equivalent to using the image pull policy `
 ### Kubelet Caching
 
 The kubelet will track, in memory, a pulled image auth cache for the credentials that were successfully used to pull an image.
-This cache will be persisted to disk using a well-defined API (**TODO**) to keep track of the authenticated images between
-kubelet restarts. **Any image that already exists on the kubelet's node and is not tracked
-is considered authless.**
-**TODO**: consider an optional list of no-auth images in kubelet config where the remaining images would still need authn.
-**TODO**: consider how to keep the cache from growing unbounded. Perhaps on image GC.
+This cache will be persisted to disk using a well-defined structure that follows standard config file API versioning techniques.
+This is done to keep track of the authenticated images between kubelet restarts.
 
 The max size of the cache will scale with the number of unique cache entries * the number of unique images that have not been garbage collected.
 It is not expected that this will be a significant number of bytes. Will be verified by actual use in Alpha and subsequent metrics in Beta.
 
-See `/var/lib/kubelet/image_manager_state` in [kubernetes/kubernetes#114847](https://github.com/kubernetes/kubernetes/pull/114847)
+#### Directory Structure
+
+A new subdirectory will be introduced to the kubelet directory: `image_manager_state`.
+There will be 3 possible sub-directories to this directory, based on the policy name currently used:
+`NeverVerifyNodePreloadedImages`, `NeverVerifyAllowlistedImages`, `AlwaysVerify`.
+Having a directory per policy allows switching between policies for the price of
+having to reverify some of the pull credentials.
+Each of these subdirectories will contain files at paths that match fully qualified image
+names.
+
+Example file for an image named `private.registry.host/secret-image:v1.21` and kubelet running
+with the `AlwaysVerify` image pull verification policy:
 
 ```
-> {
->   "images": {
->     "sha256:eb6cbbefef909d52f4b2b29f8972bbb6d86fc9dba6528e65aad4f119ce469f7a": {
->       "authHash": { ** per review comment use SHA256 here vs hash **
->         "115b8808c3e7f073": {
->           "ensured": true,
->           "dueDate": "2023-05-30T05:26:53.76740982+08:00"
->         }
->       },
->       "name": "daocloud.io/daocloud/dce-registry-tool:3.0.8"
->     }
->   }
-> }
+/var/lib/kubelet/image_manager_state/AlwaysVerify/private.registry.host/secret-image:v1.21
 ```
-**TODO**: The above is the original API proposal which will undergo further considerations
-that define at which level we want to cache a credential:
-- is it the end dockercfg credential - allows sharing the same credential across multiple secrets
-- is it the kubernetes Secret (ns/name/uid) containing the pull credentials - prevents unnecessary live pulls in case of credential rotation
-- is it all of the above
-**TODO**: Describe when a record about image being pulled is written - is it before or after a pull? Is it both? E.g. we can't know if an image would get pulled successfully beforehand, we don't know the image's digest, ...
+
+Each of these files is structured as such:
+
+```json
+// file registry.private.host/image:tag
+{
+  "apiVersion": "images.kubelet.config.k8s.io/v1alpha1",
+  "kind": "ImagePullAuthenticationMetadata",
+  "secrets": {
+    "example-bs/private-repo-secret/6fe2dae4-ff2b-4e9d-8afd-dd4c74b5f883": { "pullSuccessful": true },
+    "another-ns/private-repo-secret/c39a20ff-9552-45fa-8ca0-818139519450": { "pullSuccessful": true },
+    "another-ns/private-repo-secret/3e3b10a8-9fdb-4cd7-8f59-bff0353ec16a": { "pullSuccessful": false }
+  },
+  "credentials": { // limit by the number of pods per node -> implement as an ordered map
+    "sha256:483266ae0e0f9cf73864117ee7a2b14a3fcaf0158487f7e281c7a0bc0d9712cd": { "pullSuccessful": true },
+    "sha256:855081387716189e3921f39d92194f7759307641faf949fe70f238b691231ffc": { "pullSuccessful": false }
+  }
+}
+```
+
+#### Writing to the Cache
+
+The initial record about an authenticated image pull is written **before** the actual image pull occurs.
+This prevents situations where an image gets pulled and kubelet fails. In that case,
+based on image pull credentials verification policy, if we failed to record the pull,
+the image could become widely usable.
+
+However, if a pull was not yet successful and we failed to remove the early-written
+record, either a previous or any next successful authenticated pulls would also grant
+access to this set of credentials of an unknown state. Therefore another file write
+must occur **after** a pull succeeded and set the credentials' cached record's
+field `pullSuccessful` to `true`.
+
+Each file representing an image being pulled with credentials should be removed as
+the image gets garbage collected off of the node to avoid unbounded cache growth.
+
+**TODO**: GC only keeps the image ID it [gets from the container runtime](https://github.com/kubernetes/kubernetes/blob/b3c725627b15bb69fca01b70848f3427aca4c3ef/pkg/kubelet/images/image_gc_manager.go#L220), and so its format is different from
+the format that we use for naming files in the cache persistent storage.
+
+#### Caching Policies
+
+Some images that already exist on the kubelet's node and are not tracked might be ignored
+for credential reverification (and therefore ignored for caching).
+
+The rules that define what should be ignored are set by the `imagePullCredentialsVerificationPolicy`:
+- `NeverVerify` disables the cache completely
+- `NeverVerifyNodePreloadedImages` images pulled without a secret and those pulled
+  outside the kubelet process are ignored
+- `NeverVerifyAllowlistedImages` - images pulled without a secret and those pulled
+  outside the kubelet process but mentioned in `preloadedImagesVerificationAllowlist` are ignored
+  - **TODO:** how do we distinguish a no-auth image and preloaded one? If we don't,
+    I could try to guess a name of an image pulled outside of the kubelet process
+    that should be reverified according to the policy, but if I don't specify a
+    pull secret, kubelet might assume it's just a no-auth image.
+  - **TODO:** if we made the allow-list global and not just for pre-loaded images,
+    that might put the registry in critical path for the `IfNotPresent`/`Never`
+    image pull policies for images outside the allow-list for images being pulled
+    without a secret.
+- `AlwaysVerify` - all the image pulls need reverification.
+  - **TODO:** same todos about distinguishing pull-with-secret and "no-auth" images
 
 ### Test Plan
 
@@ -379,7 +441,8 @@ TBD subsequent to alpha
   - Feature gate name: KubeletEnsureSecretPulledImages
   - Components depending on the feature gate: Kubelet
 - [x] Other
-  - Describe the mechanism: Disabling is possible via the kubelet configuration field `noPullImageSecretRecheck`
+  - Describe the mechanism: Disabling is possible by setting the kubelet configuration field
+    `imagePullCredentialsVerificationPolicy` to value `NeverVerify`
   - Will enabling / disabling the feature require downtime of the control
     plane?
     - No, only a restart of the kubelet
